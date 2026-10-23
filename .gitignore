@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+data/mqp.csv
+outputs/duplicate_detector.pt
+# User-specific caches / bulky pretrained weights
+models/
+.cache/
+.DS_Store
+Thumbs.db
+
+# --- MP-C42 public repository exclusions ---
+*.pt
+*.pth
+*.safetensors
+*.bin
+.env
+.env.*
+data/mqp.csv
+outputs/test_predictions.csv
+outputs/results.json
+outputs/MP-C42_Report.docx
+outputs/backup_before_upgrade/
+MP-C42_Accuracy_Upgrade_Patch*.zip
+fix_demo.py

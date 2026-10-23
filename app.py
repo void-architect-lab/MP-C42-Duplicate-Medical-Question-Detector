@@ -1,0 +1,180 @@
+"""Gradio application for MP-C42.
+
+If outputs/duplicate_detector.pt exists, the app loads the fine-tuned course GPTModel.
+Otherwise it opens in a clearly labelled offline heuristic fallback so the interface can
+still be demonstrated; run train.py before an evaluated project demo.
+"""
+from __future__ import annotations
+
+import difflib
+import re
+from pathlib import Path
+
+import gradio as gr
+
+ROOT = Path(__file__).resolve().parent
+CHECKPOINT = ROOT / "outputs" / "duplicate_detector.pt"
+MODEL = None
+TOKENIZER = None
+DEVICE = "cpu"
+MAX_LENGTH = 96
+POSITIVE_THRESHOLD = 0.5
+MODE = "OFFLINE HEURISTIC FALLBACK - GPT-2 checkpoint not found"
+
+
+def _load_model() -> None:
+    global MODEL, TOKENIZER, DEVICE, MAX_LENGTH, POSITIVE_THRESHOLD, MODE
+    if not CHECKPOINT.exists():
+        return
+    try:
+        import torch
+        import tiktoken
+        from src.gpt_model import GPT2_SMALL_CONFIG, GPTModel
+        checkpoint = torch.load(CHECKPOINT, map_location="cpu", weights_only=False)
+        model = GPTModel(GPT2_SMALL_CONFIG, num_classes=2)
+        model.load_state_dict(checkpoint["state_dict"])
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        MODEL = model.to(DEVICE).eval()
+        TOKENIZER = tiktoken.get_encoding("gpt2")
+        MAX_LENGTH = int(checkpoint.get("max_length", 96))
+        POSITIVE_THRESHOLD = float(checkpoint.get("positive_threshold", 0.5))
+        MODE = f"GPT-2 Small + transparent synonym/overlap check | device: {DEVICE} | GPT-2 similar threshold: {POSITIVE_THRESHOLD:.2f}"
+    except Exception as exc:
+        MODE = f"OFFLINE HEURISTIC FALLBACK - model load failed: {exc}"
+
+
+_load_model()
+
+_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+    "what", "which", "who", "whom", "when", "where", "why", "how", "can", "could", "would", "should",
+    "may", "might", "will", "to", "of", "in", "on", "at", "for", "from", "with", "by", "about", "me",
+    "my", "your", "their", "someone", "someone's", "person", "people", "please", "tell", "explain", "get",
+    "that", "has", "have", "had", "having", "ones", "doesnt",
+}
+_SYNONYMS = {
+    "sign": "symptoms", "signs": "symptoms", "symptom": "symptoms", "indication": "symptoms",
+    "indications": "symptoms", "indicate": "symptoms", "indicates": "symptoms", "show": "symptoms",
+    "shows": "symptoms", "showing": "symptoms",
+    "cause": "causes", "caused": "causes", "causing": "causes", "leads": "causes", "lead": "causes",
+    "result": "causes", "results": "causes", "trigger": "causes", "triggers": "causes",
+    "develop": "causes", "develops": "causes", "developed": "causes", "arise": "causes", "arises": "causes",
+    "hypertension": "highbloodpressure", "high-blood-pressure": "highbloodpressure",
+    "heartattack": "myocardialinfarction", "heart-attack": "myocardialinfarction",
+    "used": "treat", "use": "treat", "uses": "treat", "role": "treat",
+    "treating": "treat", "treatment": "treat", "therapy": "treat", "cure": "treat",
+    "prevented": "prevent", "prevents": "prevent", "preventing": "prevent", "prevention": "prevent", "avoiding": "prevent", "avoid": "prevent",
+}
+
+
+def _tokens(text: str) -> list[str]:
+    text = text.lower()
+    # Normalize common multi-word/one-word medical paraphrases to the same token.
+    text = re.sub(r"\bhigh[\s-]+blood[\s-]+pressure\b", " highbloodpressure ", text)
+    text = text.replace("can't", "can not").replace("cannot", "can not").replace("isn't", "is not").replace("doesn't", "does not")
+    text = re.sub(r"\b(\d+)\s*[- ]?year[- ]old\b", r" age\1 ", text)
+    tokens = re.findall(r"[a-z]+(?:'[a-z]+)?|\d+", text)
+    result = []
+    for token in tokens:
+        token = _SYNONYMS.get(token, token)
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and len(token) > 4 and token not in {"diabetes", "series", "symptoms", "causes"}:
+            token = token[:-1]
+        if token not in _STOPWORDS:
+            result.append(token)
+    return result
+
+
+def heuristic_predict(q1: str, q2: str) -> tuple[str, float, str]:
+    """Emergency demo fallback only; not a substitute for the fine-tuned GPT-2 model."""
+    a, b = _tokens(q1), _tokens(q2)
+    set_a, set_b = set(a), set(b)
+    union = set_a | set_b
+    jaccard = len(set_a & set_b) / max(1, len(union))
+    ratio = difflib.SequenceMatcher(None, " ".join(a), " ".join(b)).ratio()
+    score = 0.62 * jaccard + 0.38 * ratio
+
+    # Surface-level intent conflict guards; useful for demo examples, not clinical reasoning.
+    a_words, b_words = set(a), set(b)
+    intents = {"causes", "prevent", "treat", "diagnose", "symptoms", "risk", "dose"}
+    intent_a, intent_b = a_words & intents, b_words & intents
+    if intent_a and intent_b and intent_a.isdisjoint(intent_b):
+        score -= 0.18
+    neg_a = bool({"not", "no", "without", "never"} & set(re.findall(r"[a-z]+", q1.lower())))
+    neg_b = bool({"not", "no", "without", "never"} & set(re.findall(r"[a-z]+", q2.lower())))
+    if neg_a != neg_b:
+        score -= 0.16
+    if len(set_a & set_b) < 2:
+        score = min(score, 0.25)
+
+    score = max(0.0, min(1.0, score))
+    label = "SIMILAR" if score >= 0.58 else "DIFFERENT"
+    confidence = max(score, 1.0 - score)
+    explanation = "Fallback estimate from normalized word overlap and phrase similarity. It does not understand medicine and must not be used for clinical decisions."
+    return label, float(confidence), explanation
+
+
+def predict_pair(question_1: str, question_2: str) -> tuple[str, str]:
+    q1 = (question_1 or "").strip()
+    q2 = (question_2 or "").strip()
+    if not q1 or not q2:
+        return "Please enter both questions.", "Enter one question in each box."
+
+    if MODEL is None:
+        label, confidence, explanation = heuristic_predict(q1, q2)
+        return f"{label}  |  fallback score: {confidence:.1%}", explanation + "\n\nMode: OFFLINE HEURISTIC FALLBACK. Run `python train.py` to load the GPT-2 classifier."
+
+    import torch
+    from src.data_utils import make_pair_tokens
+    token_ids = make_pair_tokens(q1, q2, TOKENIZER, max_length=MAX_LENGTH)
+    x = torch.tensor([token_ids], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        logits = MODEL(x)[0, -1, :]
+        probabilities = torch.softmax(logits, dim=-1)
+        p_similar = float(probabilities[1].item())
+        class_id = int(p_similar >= POSITIVE_THRESHOLD)
+    model_label = "SIMILAR" if class_id == 1 else "DIFFERENT"
+    rule_label, rule_score, _ = heuristic_predict(q1, q2)
+    # Transparent hybrid postprocessor: strong normalized token/synonym matches
+    # can rescue GPT-2 false negatives. No individual demo questions are hard-coded.
+    rule_override = model_label == "DIFFERENT" and rule_label == "SIMILAR"
+    label = "SIMILAR" if rule_override else model_label
+    if rule_override:
+        result = f"SIMILAR (rule-based overlap/synonym check)  |  GPT-2 P(SIMILAR): {p_similar:.1%}"
+        note = (f"GPT-2 P(SIMILAR) is {p_similar:.1%}, below its validation-selected threshold of "
+                f"{POSITIVE_THRESHOLD:.0%}. A separate rule-based check found strong normalized word/synonym "
+                f"overlap (heuristic score {rule_score:.1%}) and changed the final label to SIMILAR. "
+                "This hybrid fallback can also make mistakes; the score is not medical certainty and must be reviewed.")
+    else:
+        result = f"{label}  |  GPT-2 P(SIMILAR): {p_similar:.1%}"
+        note = (f"GPT-2 P(SIMILAR): {p_similar:.1%}; validation-selected threshold: "
+                f"{POSITIVE_THRESHOLD:.0%}. The rule-based check did not override this result. "
+                "This is an academic prototype, not a medical diagnostic tool; review results manually.")
+    return result, note
+
+
+with gr.Blocks(title="MP-C42 | Duplicate Medical Question Detector", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# Duplicate Medical Question Detector")
+    gr.Markdown("Enter two medical questions. This academic prototype combines a fine-tuned GPT-2 classifier with a transparent rule-based word/synonym consistency check; both can make mistakes.")
+    gr.Markdown(f"**Current mode:** `{MODE}`")
+    with gr.Row():
+        q1 = gr.Textbox(label="Medical question 1", placeholder="e.g., What are common symptoms of diabetes?", lines=4)
+        q2 = gr.Textbox(label="Medical question 2", placeholder="e.g., Which signs may indicate diabetes?", lines=4)
+    run = gr.Button("Compare questions", variant="primary")
+    output = gr.Textbox(label="Prediction", interactive=False)
+    note = gr.Textbox(label="Important note", interactive=False, lines=3)
+    run.click(predict_pair, inputs=[q1, q2], outputs=[output, note])
+    gr.Examples(
+        examples=[
+            ["What are common symptoms of diabetes?", "Which signs may indicate that someone has diabetes?"],
+            ["Can aspirin cause stomach bleeding?", "How can stomach bleeding be prevented?"],
+            ["What causes high blood pressure?", "Why might a person develop hypertension?"],
+            ["Is insulin used to treat type 1 diabetes?", "What is the role of insulin in type 1 diabetes?"],
+            ["Does a sore throat always mean strep infection?", "What are the symptoms of a urinary tract infection?"],
+        ], inputs=[q1, q2], label="Try sample pairs"
+    )
+    gr.Markdown("*Academic prototype only. Do not use it for diagnosis, triage, or patient-care decisions.*")
+
+if __name__ == "__main__":
+    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, show_error=True)

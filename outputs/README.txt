@@ -1,0 +1,1 @@
+Training creates results.json, plots, CSV evaluation predictions, and duplicate_detector.pt in this folder. The checkpoint is excluded from Git as requested by the course brief. Keep the metrics/plots in the repository, but do not upload model weights.

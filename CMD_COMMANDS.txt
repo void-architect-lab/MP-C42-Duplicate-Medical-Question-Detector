@@ -1,0 +1,25 @@
+MP-C42 QUICK START (Windows CMD)
+================================
+
+1. Download the ZIP and extract it into C:\Users\Yashas\ (the ZIP contains the project folder).
+2. Open Command Prompt and paste these two lines:
+
+cd /d "%USERPROFILE%\MP-C42_Duplicate_Medical_Question_Detector"
+START_HERE.bat
+
+This installs dependencies, downloads the public data and pretrained GPT-2 weights, trains the small classifier, generates measured results/plots/Word report, then launches the demo. The first run requires internet access and several GB of free disk space. Close/unload models in LM Studio while training so they do not consume GPU memory.
+
+AFTER THE FIRST SUCCESSFUL RUN
+------------------------------
+To reopen just the app later:
+
+cd /d "%USERPROFILE%\MP-C42_Duplicate_Medical_Question_Detector"
+run_demo.bat
+
+If training runs out of GPU memory, close LM Studio and retry with a smaller batch:
+
+cd /d "%USERPROFILE%\MP-C42_Duplicate_Medical_Question_Detector"
+call .venv\Scripts\activate.bat
+python train.py --max-samples 1024 --epochs 2 --batch-size 4 --max-length 96
+
+If you have not set up Git, install Git for Windows from https://git-scm.com/download/win first. To upload the code, create an empty public repository in your browser, then follow the exact commands in README.md. Do not upload outputs\duplicate_detector.pt; the course instructions explicitly say not to submit model weight files.
